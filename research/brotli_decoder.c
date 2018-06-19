@@ -7,23 +7,27 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #include <brotli/decode.h>
 
-#define BUFFER_SIZE (1u << 20)
+#define BUFFER_SIZE (5u << 20)
 
 typedef struct Context {
-  FILE* fin;
-  FILE* fout;
+  int fd_in;
+  int in_size;
   uint8_t* input_buffer;
   uint8_t* output_buffer;
   BrotliDecoderState* decoder;
 } Context;
 
 void init(Context* ctx) {
-  ctx->fin = 0;
-  ctx->fout = 0;
-  ctx->input_buffer = 0;
+  ctx->fd_in = -1;
+  ctx->in_size = -1;
+  ctx->input_buffer = (uint8_t*) -1;
   ctx->output_buffer = 0;
   ctx->decoder = 0;
 }
@@ -31,13 +35,13 @@ void init(Context* ctx) {
 void cleanup(Context* ctx) {
   if (ctx->decoder) BrotliDecoderDestroyInstance(ctx->decoder);
   if (ctx->output_buffer) free(ctx->output_buffer);
-  if (ctx->input_buffer) free(ctx->input_buffer);
-  if (ctx->fout) fclose(ctx->fout);
-  if (ctx->fin) fclose(ctx->fin);
+  if (ctx->input_buffer != (uint8_t*) -1) munmap(ctx->input_buffer, ctx->in_size);
+  if (ctx->fd_in != -1) close(ctx->fd_in);
 }
 
 void fail(Context* ctx, const char* message) {
   fprintf(stderr, "%s\n", message);
+  cleanup(ctx);
   exit(1);
 }
 
@@ -48,30 +52,41 @@ int main(int argc, char** argv) {
   const uint8_t* next_in;
   size_t available_out = BUFFER_SIZE;
   uint8_t* next_out;
+  int start_offset;
+
   init(&ctx);
 
-  ctx.fin = fdopen(STDIN_FILENO, "rb");
-  if (!ctx.fin) fail(&ctx, "can't open input file");
-  ctx.fout = fdopen(STDOUT_FILENO, "wb");
-  if (!ctx.fout) fail(&ctx, "can't open output file");
-  ctx.input_buffer = (uint8_t*)malloc(BUFFER_SIZE);
-  if (!ctx.input_buffer) fail(&ctx, "out of memory / input buffer");
+  if (argc != 3) {
+    fprintf(stderr, "Usage: %s FILE OFFSET\n", argv[0]);
+  }
+  start_offset = atoi(argv[2]);
+
+  ctx.fd_in = open(argv[1], O_RDONLY);
+  if (ctx.fd_in == -1) fail(&ctx, "can't open input file");
+  ctx.in_size = lseek(ctx.fd_in, 0, SEEK_END);
+  if (ctx.in_size == -1) fail(&ctx, "can't open input file");
+  ctx.input_buffer = (uint8_t*) mmap(
+      NULL, ctx.in_size, PROT_READ, MAP_PRIVATE, ctx.fd_in, 0);
+  if (ctx.input_buffer == (uint8_t*) -1) {
+    fail(&ctx, "out of memory / input buffer");
+  }
   ctx.output_buffer = (uint8_t*)malloc(BUFFER_SIZE);
   if (!ctx.output_buffer) fail(&ctx, "out of memory / output buffer");
   ctx.decoder = BrotliDecoderCreateInstance(0, 0, 0);
   if (!ctx.decoder) fail(&ctx, "out of memory / decoder");
   BrotliDecoderSetParameter(ctx.decoder, BROTLI_DECODER_PARAM_LARGE_WINDOW, 1);
 
+  available_in = ctx.in_size - start_offset;
+  next_in = ctx.input_buffer + start_offset;
+
   next_out = ctx.output_buffer;
   while (1) {
     if (result == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT) {
-      if (feof(ctx.fin)) break;
-      available_in = fread(ctx.input_buffer, 1, BUFFER_SIZE, ctx.fin);
-      next_in = ctx.input_buffer;
-      if (ferror(ctx.fin)) break;
+      if (available_in == 0) {
+        fail(&ctx, "impossible");
+        break;
+      }
     } else if (result == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
-      fwrite(ctx.output_buffer, 1, BUFFER_SIZE, ctx.fout);
-      if (ferror(ctx.fout)) break;
       available_out = BUFFER_SIZE;
       next_out = ctx.output_buffer;
     } else {
@@ -80,14 +95,12 @@ int main(int argc, char** argv) {
     result = BrotliDecoderDecompressStream(
         ctx.decoder, &available_in, &next_in, &available_out, &next_out, 0);
   }
-  if (next_out != ctx.output_buffer) {
-    fwrite(ctx.output_buffer, 1, next_out - ctx.output_buffer, ctx.fout);
-  }
-  if ((result == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) || ferror(ctx.fout)) {
+  if (result == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
     fail(&ctx, "failed to write output");
   } else if (result != BROTLI_DECODER_RESULT_SUCCESS) {
     fail(&ctx, "corrupt input");
   }
   cleanup(&ctx);
+  fprintf(stderr, "done\n");
   return 0;
 }
